@@ -13,13 +13,12 @@ const PERIOD    = 21;
 const GRANULARITY = 5; 
 const MAX_CANDLES = 70;
 
-// Pulled securely from Render Environment Variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 let history = [];
 let ws;
-let lastAlertTime = 0; // Cooldown timer
+let lastAlertTime = 0; 
 
 // --- 1. EXPRESS SERVER (For Render & Cron-Job) ---
 app.get('/ping', (req, res) => {
@@ -32,10 +31,7 @@ app.listen(PORT, () => {
 
 // --- 2. TELEGRAM ALERT SYSTEM ---
 async function sendTelegramAlert(price, ema) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-        console.log("Alert triggered, but Telegram credentials are missing!");
-        return;
-    }
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
     const now = Date.now();
     // 60-second cooldown to prevent notification spam
@@ -53,7 +49,56 @@ async function sendTelegramAlert(price, ema) {
     }
 }
 
-// --- 3. TRADING LOGIC ---
+// --- 3. TELEGRAM COMMAND LISTENER (/status) ---
+let lastUpdateId = 0;
+
+async function sendStatusMessage(targetChatId) {
+    if (history.length === 0) {
+        const warmUpMsg = "⏳ *Bot is currently warming up!*\nGathering historical 5s candles. Please try again in a few moments.";
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${targetChatId}&text=${encodeURIComponent(warmUpMsg)}&parse_mode=Markdown`);
+        return;
+    }
+
+    const curr = history[history.length - 1];
+    const trend = curr.close >= curr.ema ? "🟢 Bullish (Above EMA)" : "🔴 Bearish (Below EMA)";
+    
+    const statusMsg = `📊 *BTC/USD Live Status*\n\n*Current Price:* $${curr.close.toFixed(2)}\n*21 EMA:* $${curr.ema.toFixed(2)}\n*Trend:* ${trend}\n\n_Monitoring 5s timeframe 24/7..._`;
+    
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${targetChatId}&text=${encodeURIComponent(statusMsg)}&parse_mode=Markdown`);
+}
+
+// Long-polling function to check for new messages
+async function pollTelegram() {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=20`;
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.ok && data.result.length > 0) {
+            for (const update of data.result) {
+                lastUpdateId = update.update_id;
+                const message = update.message;
+                
+                // If user types exactly "/status"
+                if (message && message.text === '/status') {
+                    console.log("Status check requested via Telegram.");
+                    await sendStatusMessage(message.chat.id);
+                }
+            }
+        }
+    } catch (error) {
+        // Silently catch timeouts to keep the polling loop clean
+    }
+    
+    // Loop continuously to keep listening
+    pollTelegram();
+}
+
+// Start listening for Telegram commands immediately
+pollTelegram();
+
+// --- 4. TRADING LOGIC ---
 function calculateAllEMA() {
     for (let i = 0; i < history.length; i++) {
         if (i === 0) {
@@ -88,7 +133,6 @@ function connect() {
             }));
         }
 
-        // Build historical 5s candles
         if (response.msg_type === 'history') {
             const p = response.history.prices;
             const t = response.history.times;
@@ -115,7 +159,6 @@ function connect() {
             console.log("History compiled. Monitoring live 5s candles...");
         }
 
-        // Live Tick Updates
         if (response.msg_type === 'tick') {
             const price = response.tick.quote;
             const epoch = response.tick.epoch;
@@ -136,7 +179,6 @@ function connect() {
             const currentEma = history[history.length - 1].ema;
             const curr = history[history.length - 1];
             
-            // Touch condition
             if (curr.low <= currentEma && curr.high >= currentEma) {
                 if (!curr.alerted) {
                     sendTelegramAlert(curr.close, currentEma);

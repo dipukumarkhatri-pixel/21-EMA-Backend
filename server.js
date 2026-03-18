@@ -1,19 +1,20 @@
 const express = require('express');
 const WebSocket = require('ws');
+const fetch = require('node-fetch'); // Ensure this is installed: npm install node-fetch@2
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
 const API_TOKEN = 'TpVIBWpqet5X8AH'; 
-const APP_ID    = '1089';
-const WS_URL    = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
-const PERIOD    = 21;
-const GRANULARITY = 900; // 15 minutes in seconds
-const MAX_CANDLES = 70;
+const TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN';
+const TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID';
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const APP_ID = '1089';
+const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+const PERIOD = 21;
+const GRANULARITY = 900; // 15 Minutes
+const MAX_CANDLES = 70;
 
 const PAIRS = {
     'cryBTCUSD': 'BTC/USD',
@@ -26,218 +27,128 @@ const PAIRS = {
 };
 
 let history = {};
-let lastAlertTime = {};
-Object.keys(PAIRS).forEach(sym => {
-    history[sym] = [];
-    lastAlertTime[sym] = 0;
-});
+let lastUpdateId = 0;
+Object.keys(PAIRS).forEach(sym => { history[sym] = []; });
 
-let ws;
+// --- 1. TELEGRAM FUNCTIONS ---
 
-// --- 1. EXPRESS SERVER ---
-app.get('/ping', (req, res) => {
-    res.status(200).send("Bot is awake and monitoring all pairs!");
-});
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
-
-// --- 2. TELEGRAM ALERT SYSTEM ---
-async function sendTelegramAlert(symbol, price, ema) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-
-    const now = Date.now();
-    if (now - lastAlertTime[symbol] < 60000) return; 
-
-    const pairName = PAIRS[symbol];
-    const msg = `🚨 *${pairName} ALERT*\n\nPrice touched the 21 EMA!\nPrice: ${price.toFixed(5)}\nEMA: ${ema.toFixed(5)}\nTimeframe: 15m`;
+// Send Automatic Crossover Alerts
+async function sendTelegramAlert(symbol, price, ema, type) {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const emoji = type === "BUY" ? "🟢" : "🔴";
+    const msg = `${emoji} *${PAIRS[symbol]} ${type} CROSS*\n\nPrice: ${price.toFixed(5)}\nEMA: ${ema.toFixed(5)}\nTF: 15m`;
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELEGRAM_CHAT_ID}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`;
-
-    try {
-        await fetch(url);
-        console.log(`[${new Date().toLocaleTimeString()}] Alert sent to Telegram for ${pairName}!`);
-        lastAlertTime[symbol] = now;
-    } catch (error) {
-        console.error(`Failed to send Telegram message for ${pairName}:`, error);
-    }
+    try { await fetch(url); } catch (e) { console.error("Alert Error:", e.message); }
 }
 
-// --- 3. TELEGRAM COMMAND LISTENER (/status) ---
-let lastUpdateId = 0;
-
-async function sendStatusMessage(targetChatId) {
-    let statusMsg = `📊 *Live Market Status (15m)*\n\n`;
-    let warmingUp = false;
+// Respond to /status Command
+async function sendStatusUpdate(chatId) {
+    let statusMsg = `📊 *Market Status (21 EMA)*\n\n`;
+    let ready = true;
 
     for (const sym in PAIRS) {
-        const symHistory = history[sym];
-        if (symHistory.length === 0) {
-            warmingUp = true;
-            break;
-        }
-        const curr = symHistory[symHistory.length - 1];
-        const trend = curr.close >= curr.ema ? "📈 Bullish" : "📉 Bearish";
-        statusMsg += `*${PAIRS[sym]}*: ${curr.close.toFixed(5)} (EMA: ${curr.ema.toFixed(5)}) - ${trend}\n`;
+        const data = history[sym];
+        if (data.length < PERIOD) { ready = false; break; }
+        
+        const curr = data[data.length - 1];
+        const trend = curr.close >= curr.ema ? "🚀 Bullish" : "📉 Bearish";
+        const diff = (((curr.close - curr.ema) / curr.ema) * 100).toFixed(2);
+        
+        statusMsg += `*${PAIRS[sym]}*: ${curr.close.toFixed(2)}\n└ ${trend} (${diff}% from EMA)\n\n`;
     }
 
-    if (warmingUp) {
-        statusMsg = "⏳ *Bot is currently warming up!*\nGathering historical 15m candles. Please try again in a few moments.";
-    } else {
-        statusMsg += `\n_Monitoring 15m timeframe 24/7.._.`;
-    }
+    if (!ready) statusMsg = "⏳ *Bot is warming up...* Still collecting candle data.";
     
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${targetChatId}&text=${encodeURIComponent(statusMsg)}&parse_mode=Markdown`);
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(statusMsg)}&parse_mode=Markdown`;
+    try { await fetch(url); } catch (e) { console.error("Status Reply Error:", e.message); }
 }
 
+// Polling for Telegram Commands
 async function pollTelegram() {
     if (!TELEGRAM_BOT_TOKEN) return;
     try {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=20`;
-        const response = await fetch(url);
-        const data = await response.json();
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`;
+        const res = await fetch(url);
+        const data = await res.json();
         
         if (data.ok && data.result.length > 0) {
             for (const update of data.result) {
                 lastUpdateId = update.update_id;
-                const message = update.message;
-                
-                if (message && message.text === '/status') {
-                    console.log("Status check requested via Telegram.");
-                    await sendStatusMessage(message.chat.id);
+                if (update.message && update.message.text === '/status') {
+                    await sendStatusUpdate(update.message.chat.id);
                 }
             }
         }
-    } catch (error) {}
-    pollTelegram();
+    } catch (e) { /* Silent fail for polling */ }
+    setTimeout(pollTelegram, 3000);
 }
 
-pollTelegram();
+// --- 2. LOGIC & CONNECTION ---
 
-// --- 4. TRADING LOGIC ---
-function calculateAllEMA(symbol) {
+function calculateEMA(symbol) {
     const symHistory = history[symbol];
+    const k = 2 / (PERIOD + 1);
     for (let i = 0; i < symHistory.length; i++) {
         if (i === 0) {
             symHistory[i].ema = symHistory[i].close;
         } else {
-            const k = 2 / (PERIOD + 1);
             const prevEMA = symHistory[i - 1].ema;
             symHistory[i].ema = (symHistory[i].close - prevEMA) * k + prevEMA;
         }
     }
 }
 
-function checkAndLogLastTouch(symbol) {
-    const symHistory = history[symbol];
-    for (let i = symHistory.length - 2; i >= 0; i--) {
-        const curr = symHistory[i];
-        if (curr.ema && curr.low <= curr.ema && curr.high >= curr.ema) {
-            const date = new Date(curr.time * 1000).toLocaleString();
-            console.log(`[STARTUP CHECK] ${PAIRS[symbol]} - Last 21 EMA touch occurred at: ${date} (Price/EMA: ~${curr.ema.toFixed(5)})`);
-            return; 
-        }
-    }
-    console.log(`[STARTUP CHECK] ${PAIRS[symbol]} - No EMA touch found in the recent historical data.`);
-}
-
 function connect() {
-    ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(WS_URL);
     
     ws.on('open', () => {
-        console.log("Connected to Deriv. Authenticating...");
+        console.log("Connected to Deriv.");
         ws.send(JSON.stringify({ authorize: API_TOKEN }));
+        setInterval(() => { if(ws.readyState === 1) ws.send(JSON.stringify({ping:1})); }, 30000);
     });
 
-    ws.on('message', (data) => {
-        const response = JSON.parse(data);
+    ws.on('message', (raw) => {
+        const res = JSON.parse(raw);
 
-        if (response.msg_type === 'authorize') {
-            console.log("Authenticated. Fetching 15m candles for all pairs...");
+        if (res.msg_type === 'authorize') {
             Object.keys(PAIRS).forEach(sym => {
-                ws.send(JSON.stringify({ 
-                    ticks_history: sym, 
-                    end: 'latest', 
-                    count: MAX_CANDLES,      // We only need exactly 70 candles now!
-                    style: 'candles',        // Native candles instead of ticks
-                    granularity: GRANULARITY, 
-                    subscribe: 1 
-                }));
+                ws.send(JSON.stringify({ ticks_history: sym, count: MAX_CANDLES, style: 'candles', granularity: GRANULARITY, subscribe: 1 }));
             });
         }
 
-        // Handle Historical Native Candles
-        if (response.msg_type === 'candles') {
-            const symbol = response.echo_req.ticks_history;
-            if (!PAIRS[symbol]) return;
-
-            // Map Deriv's candle array directly to our format
-            history[symbol] = response.candles.map(c => ({
-                time: c.epoch,
-                open: parseFloat(c.open),
-                high: parseFloat(c.high),
-                low: parseFloat(c.low),
-                close: parseFloat(c.close),
-                alerted: false
-            }));
-            
-            calculateAllEMA(symbol);
-            console.log(`History compiled for ${PAIRS[symbol]}. Monitoring live 15m OHLC stream...`);
-            checkAndLogLastTouch(symbol);
+        if (res.msg_type === 'candles') {
+            const sym = res.echo_req.ticks_history;
+            history[sym] = res.candles.map(c => ({ time: c.epoch, close: parseFloat(c.close) }));
+            calculateEMA(sym);
+            console.log(`Loaded ${PAIRS[sym]}`);
         }
 
-        // Handle Live Native Candle Streams
-        if (response.msg_type === 'ohlc') {
-            const symbol = response.ohlc.symbol;
-            if (!PAIRS[symbol]) return;
-
-            const ohlc = response.ohlc;
-            const bucket = ohlc.open_time; // The start time of the current 15m candle
-            const currentPrice = parseFloat(ohlc.close);
-            
-            const symHistory = history[symbol];
-            let lastCandle = symHistory[symHistory.length - 1];
-
-            // Update the currently forming candle, or create a new one if 15m has passed
-            if (lastCandle && lastCandle.time === bucket) {
-                lastCandle.high = parseFloat(ohlc.high);
-                lastCandle.low = parseFloat(ohlc.low);
-                lastCandle.close = currentPrice;
-            } else {
-                symHistory.push({ 
-                    time: bucket, 
-                    open: parseFloat(ohlc.open), 
-                    high: parseFloat(ohlc.high), 
-                    low: parseFloat(ohlc.low), 
-                    close: currentPrice, 
-                    alerted: false 
-                });
+        if (res.msg_type === 'ohlc') {
+            const sym = res.ohlc.symbol;
+            if (res.ohlc.is_closed) {
+                const symHistory = history[sym];
+                const newClose = parseFloat(res.ohlc.close);
+                
+                symHistory.push({ time: res.ohlc.open_time, close: newClose });
                 if (symHistory.length > MAX_CANDLES) symHistory.shift();
-                lastCandle = symHistory[symHistory.length - 1];
-            }
+                calculateEMA(sym);
 
-            calculateAllEMA(symbol);
+                const current = symHistory[symHistory.length - 1];
+                const previous = symHistory[symHistory.length - 2];
 
-            const currentEma = lastCandle.ema;
-            
-            // Alert logic check
-            if (lastCandle.low <= currentEma && lastCandle.high >= currentEma) {
-                if (!lastCandle.alerted) {
-                    sendTelegramAlert(symbol, currentPrice, currentEma);
-                    lastCandle.alerted = true; // Prevents firing again on the same 15m candle
+                if (previous.close < previous.ema && current.close > current.ema) {
+                    sendTelegramAlert(sym, current.close, current.ema, "BUY");
+                } else if (previous.close > previous.ema && current.close < current.ema) {
+                    sendTelegramAlert(sym, current.close, current.ema, "SELL");
                 }
             }
         }
     });
 
-    ws.on('close', () => {
-        console.log("WebSocket disconnected. Reconnecting in 3s...");
-        setTimeout(connect, 3000);
-    });
-
-    ws.on('error', (err) => {
-        console.error("WebSocket Error:", err);
-    });
+    ws.on('close', () => setTimeout(connect, 5000));
 }
 
+// Start everything
+app.listen(PORT, () => console.log(`Bot Running on Port ${PORT}`));
 connect();
+pollTelegram();

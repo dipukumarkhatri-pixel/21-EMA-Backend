@@ -25,7 +25,7 @@ const PAIRS = {
 
 const PERIOD = 21;
 const MAX_CANDLES = 70;
-const TF = 30;
+const TF = 900;
 
 // ===== TELEGRAM =====
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -64,10 +64,10 @@ async function sendTelegram(symbol, type, price, ema) {
     const now = Date.now();
     if (now - lastAlertTime[symbol] < 60000) return;
 
-    const msg = `🚨 ${PAIRS[symbol]} ${type}
+    const msg = `🚨 ${PAIRS[symbol]} ${type}\n
 
 Price: ${price.toFixed(5)}
-EMA: ${ema.toFixed(5)}
+EMA: ${ema.toFixed(5)}\n
 TF: 15m`;
 
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}`;

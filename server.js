@@ -1,243 +1,233 @@
-const express = require('express');
-const WebSocket = require('ws');
+const WebSocket = require("ws");
+const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURATION ---
-const API_TOKEN = 'TpVIBWpqet5X8AH'; 
-const APP_ID    = '1089';
-const WS_URL    = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
-const PERIOD    = 21;
-const GRANULARITY = 900; // 15 minutes in seconds
-const MAX_CANDLES = 70;
-
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// ===== CONFIG =====
+const SYMBOLS = [
+    "frxEURUSD",
+    "frxGBPUSD",
+    "frxAUDCAD",
+    "frxEURCAD",
+    "frxAUDJPY",
+    "frxUSDCAD"
+];
 
 const PAIRS = {
-    'cryBTCUSD': 'BTC/USD',
-    'frxEURUSD': 'EUR/USD',
-    'frxGBPUSD': 'GBP/USD',
-    'frxEURAUD': 'EUR/AUD',
-    'frxAUDCAD': 'AUD/CAD',
-    'frxUSDCAD': 'USD/CAD',
-    'frxAUDJPY': 'AUD/JPY'
+    "frxEURUSD": "EUR/USD",
+    "frxGBPUSD": "GBP/USD",
+    "frxAUDCAD": "AUD/CAD",
+    "frxEURCAD": "EUR/CAD",
+    "frxAUDJPY": "AUD/JPY",
+    "frxUSDCAD": "USD/CAD"
 };
 
-let history = {};
+const PERIOD = 21;
+const MAX_CANDLES = 70;
+const TF = 30;
+
+// ===== TELEGRAM =====
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+let lastUpdateId = 0;
 let lastAlertTime = {};
-Object.keys(PAIRS).forEach(sym => {
-    history[sym] = [];
+
+// ===== DATA STORE =====
+let market = {};
+
+SYMBOLS.forEach(sym => {
+    market[sym] = {
+        candles: [],
+        current: null,
+        signal: "WAIT"
+    };
     lastAlertTime[sym] = 0;
 });
 
-let ws;
+// ===== EMA =====
+function EMA(data) {
+    let k = 2 / (PERIOD + 1);
+    let ema = data[0];
 
-// --- 1. EXPRESS SERVER ---
-app.get('/ping', (req, res) => {
-    res.status(200).send("Bot is awake and monitoring all pairs!");
-});
+    for (let i = 1; i < data.length; i++) {
+        ema = (data[i] - ema) * k + ema;
+    }
+    return ema;
+}
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
-
-// --- 2. TELEGRAM ALERT SYSTEM ---
-async function sendTelegramAlert(symbol, price, ema) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+// ===== TELEGRAM SEND =====
+async function sendTelegram(symbol, type, price, ema) {
+    if (!BOT_TOKEN || !CHAT_ID) return;
 
     const now = Date.now();
-    if (now - lastAlertTime[symbol] < 60000) return; 
+    if (now - lastAlertTime[symbol] < 60000) return;
 
-    const pairName = PAIRS[symbol];
-    const msg = `🚨 *${pairName} ALERT*\n\nPrice touched the 21 EMA!\nPrice: ${price.toFixed(5)}\nEMA: ${ema.toFixed(5)}\nTimeframe: 15m`;
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELEGRAM_CHAT_ID}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`;
+    const msg = `🚨 ${PAIRS[symbol]} ${type}
+
+Price: ${price.toFixed(5)}
+EMA: ${ema.toFixed(5)}
+TF: 15m`;
+
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}`;
 
     try {
         await fetch(url);
-        console.log(`[${new Date().toLocaleTimeString()}] Alert sent to Telegram for ${pairName}!`);
+        console.log("📩 Sent:", symbol, type);
         lastAlertTime[symbol] = now;
-    } catch (error) {
-        console.error(`Failed to send Telegram message for ${pairName}:`, error);
+    } catch (e) {
+        console.log("Telegram error");
     }
 }
 
-// --- 3. TELEGRAM COMMAND LISTENER (/status) ---
-let lastUpdateId = 0;
+// ===== TELEGRAM STATUS =====
+async function sendStatus(chatId) {
+    let text = "📊 LIVE STATUS (15m)\n\n";
 
-async function sendStatusMessage(targetChatId) {
-    let statusMsg = `📊 *Live Market Status (15m)*\n\n`;
-    let warmingUp = false;
+    for (let sym of SYMBOLS) {
+        let data = market[sym];
+        let last = data.candles[data.candles.length - 1];
 
-    for (const sym in PAIRS) {
-        const symHistory = history[sym];
-        if (symHistory.length === 0) {
-            warmingUp = true;
-            break;
+        if (!last) {
+            text += `${PAIRS[sym]}: warming...\n`;
+            continue;
         }
-        const curr = symHistory[symHistory.length - 1];
-        const trend = curr.close >= curr.ema ? "📈 Bullish" : "📉 Bearish";
-        statusMsg += `*${PAIRS[sym]}*: ${curr.close.toFixed(5)} (EMA: ${curr.ema.toFixed(5)}) - ${trend}\n`;
+
+        let trend = last.close > last.ema ? "Bullish 📈" : "Bearish 📉";
+
+        text += `${PAIRS[sym]}
+Price: ${last.close.toFixed(5)}
+EMA: ${last.ema.toFixed(5)}
+Signal: ${data.signal}
+Trend: ${trend}
+
+`;
     }
 
-    if (warmingUp) {
-        statusMsg = "⏳ *Bot is currently warming up!*\nGathering historical 15m candles. Please try again in a few moments.";
-    } else {
-        statusMsg += `\n_Monitoring 15m timeframe 24/7..._`;
-    }
-    
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${targetChatId}&text=${encodeURIComponent(statusMsg)}&parse_mode=Markdown`);
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}`);
 }
 
+// ===== TELEGRAM LISTENER =====
 async function pollTelegram() {
-    if (!TELEGRAM_BOT_TOKEN) return;
+    if (!BOT_TOKEN) return;
+
     try {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=20`;
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        if (data.ok && data.result.length > 0) {
-            for (const update of data.result) {
-                lastUpdateId = update.update_id;
-                const message = update.message;
-                
-                if (message && message.text === '/status') {
-                    console.log("Status check requested via Telegram.");
-                    await sendStatusMessage(message.chat.id);
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`);
+        const data = await res.json();
+
+        if (data.result.length > 0) {
+            for (let u of data.result) {
+                lastUpdateId = u.update_id;
+
+                if (u.message && u.message.text === "/status") {
+                    sendStatus(u.message.chat.id);
                 }
             }
         }
-    } catch (error) {}
-    pollTelegram();
+    } catch (e) {}
+
+    setTimeout(pollTelegram, 2000);
 }
 
 pollTelegram();
 
-// --- 4. TRADING LOGIC ---
-function calculateAllEMA(symbol) {
-    const symHistory = history[symbol];
-    for (let i = 0; i < symHistory.length; i++) {
-        if (i === 0) {
-            symHistory[i].ema = symHistory[i].close;
-        } else {
-            const k = 2 / (PERIOD + 1);
-            const prevEMA = symHistory[i - 1].ema;
-            symHistory[i].ema = (symHistory[i].close - prevEMA) * k + prevEMA;
-        }
-    }
-}
-
-function checkAndLogLastTouch(symbol) {
-    const symHistory = history[symbol];
-    for (let i = symHistory.length - 2; i >= 0; i--) {
-        const curr = symHistory[i];
-        if (curr.ema && curr.low <= curr.ema && curr.high >= curr.ema) {
-            const date = new Date(curr.time * 1000).toLocaleString();
-            console.log(`[STARTUP CHECK] ${PAIRS[symbol]} - Last 21 EMA touch occurred at: ${date} (Price/EMA: ~${curr.ema.toFixed(5)})`);
-            return; 
-        }
-    }
-    console.log(`[STARTUP CHECK] ${PAIRS[symbol]} - No EMA touch found in the recent historical data.`);
-}
+// ===== WS =====
+let ws;
 
 function connect() {
-    ws = new WebSocket(WS_URL);
-    
-    ws.on('open', () => {
-        console.log("Connected to Deriv. Authenticating...");
-        ws.send(JSON.stringify({ authorize: API_TOKEN }));
+    ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
+
+    ws.on("open", () => {
+        console.log("Connected");
+
+        SYMBOLS.forEach(sym => {
+            ws.send(JSON.stringify({
+                ticks: sym,
+                subscribe: 1
+            }));
+        });
     });
 
-    ws.on('message', (data) => {
-        const response = JSON.parse(data);
+    ws.on("message", async (msg) => {
+        const data = JSON.parse(msg);
 
-        if (response.msg_type === 'authorize') {
-            console.log("Authenticated. Fetching 15m candles for all pairs...");
-            Object.keys(PAIRS).forEach(sym => {
-                ws.send(JSON.stringify({ 
-                    ticks_history: sym, 
-                    end: 'latest', 
-                    count: MAX_CANDLES,      // We only need exactly 70 candles now!
-                    style: 'candles',        // Native candles instead of ticks
-                    granularity: GRANULARITY, 
-                    subscribe: 1 
-                }));
-            });
-        }
+        if (data.msg_type !== "tick") return;
 
-        // Handle Historical Native Candles
-        if (response.msg_type === 'candles') {
-            const symbol = response.echo_req.ticks_history;
-            if (!PAIRS[symbol]) return;
+        const sym = data.echo_req.ticks;
+        const price = data.tick.quote;
+        const epoch = data.tick.epoch;
 
-            // Map Deriv's candle array directly to our format
-            history[symbol] = response.candles.map(c => ({
-                time: c.epoch,
-                open: parseFloat(c.open),
-                high: parseFloat(c.high),
-                low: parseFloat(c.low),
-                close: parseFloat(c.close),
-                alerted: false
-            }));
-            
-            calculateAllEMA(symbol);
-            console.log(`History compiled for ${PAIRS[symbol]}. Monitoring live 15m OHLC stream...`);
-            checkAndLogLastTouch(symbol);
-        }
+        const obj = market[sym];
+        const bucket = Math.floor(epoch / TF);
 
-        // Handle Live Native Candle Streams
-        if (response.msg_type === 'ohlc') {
-            const symbol = response.ohlc.symbol;
-            if (!PAIRS[symbol]) return;
+        if (!obj.current || obj.current.bucket !== bucket) {
 
-            const ohlc = response.ohlc;
-            const bucket = ohlc.open_time; // The start time of the current 15m candle
-            const currentPrice = parseFloat(ohlc.close);
-            
-            const symHistory = history[symbol];
-            let lastCandle = symHistory[symHistory.length - 1];
+            // ===== CLOSE CANDLE =====
+            if (obj.current) {
+                obj.candles.push(obj.current);
 
-            // Update the currently forming candle, or create a new one if 15m has passed
-            if (lastCandle && lastCandle.time === bucket) {
-                lastCandle.high = parseFloat(ohlc.high);
-                lastCandle.low = parseFloat(ohlc.low);
-                lastCandle.close = currentPrice;
-            } else {
-                symHistory.push({ 
-                    time: bucket, 
-                    open: parseFloat(ohlc.open), 
-                    high: parseFloat(ohlc.high), 
-                    low: parseFloat(ohlc.low), 
-                    close: currentPrice, 
-                    alerted: false 
-                });
-                if (symHistory.length > MAX_CANDLES) symHistory.shift();
-                lastCandle = symHistory[symHistory.length - 1];
-            }
+                if (obj.candles.length > MAX_CANDLES)
+                    obj.candles.shift();
 
-            calculateAllEMA(symbol);
+                let closes = obj.candles.map(c => c.close);
+                let ema = EMA(closes);
 
-            const currentEma = lastCandle.ema;
-            
-            // Alert logic check
-            if (lastCandle.low <= currentEma && lastCandle.high >= currentEma) {
-                if (!lastCandle.alerted) {
-                    sendTelegramAlert(symbol, currentPrice, currentEma);
-                    lastCandle.alerted = true; // Prevents firing again on the same 15m candle
+                obj.current.ema = ema;
+
+                if (obj.candles.length > 1) {
+                    let prev = obj.candles[obj.candles.length - 2];
+                    let curr = obj.candles[obj.candles.length - 1];
+
+                    // ===== CROSS =====
+                    if (prev.close < prev.ema && curr.close > curr.ema) {
+                        obj.signal = "BUY 🚀";
+                        await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
+                    }
+                    else if (prev.close > prev.ema && curr.close < curr.ema) {
+                        obj.signal = "SELL 🔻";
+                        await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
+                    } else {
+                        obj.signal = "WAIT";
+                    }
                 }
             }
+
+            obj.current = {
+                bucket,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                ema: null
+            };
+
+        } else {
+            obj.current.high = Math.max(obj.current.high, price);
+            obj.current.low = Math.min(obj.current.low, price);
+            obj.current.close = price;
         }
     });
 
-    ws.on('close', () => {
-        console.log("WebSocket disconnected. Reconnecting in 3s...");
+    ws.on("close", () => {
+        console.log("Reconnecting...");
         setTimeout(connect, 3000);
     });
 
-    ws.on('error', (err) => {
-        console.error("WebSocket Error:", err);
-    });
+    ws.on("error", () => {});
 }
 
 connect();
+
+// ===== API =====
+app.get("/data", (req, res) => {
+    res.json(market);
+});
+
+app.get("/ping", (req, res) => {
+    res.send("Bot running 🚀");
+});
+
+app.listen(PORT, () => {
+    console.log("Server running on", PORT);
+});

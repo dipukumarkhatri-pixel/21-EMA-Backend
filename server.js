@@ -1,133 +1,162 @@
-const WebSocket = require('ws');
 const express = require('express');
+const WebSocket = require('ws');
 
-// ===== CONFIG =====
-const API_TOKEN = 'YOUR_DERIV_TOKEN';
-const TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN';
-const CHAT_ID = 'YOUR_CHAT_ID';
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// All 7 of your original symbols restored
-const SYMBOLS = [
-    "BTCUSD",
-    "EURUSD",
-    "GBPUSD",
-    "EURAUD",
-    "AUDCAD",
-    "USDCAD",
-    "AUDJPY"
-];
+// --- CONFIGURATION ---
+const API_TOKEN = 'TpVIBWpqet5X8AH'; 
+const APP_ID    = '1089';
+const WS_URL    = `wss://ws.derivws.com/websockets/v3?app_id=${APP_ID}`;
+const PERIOD    = 21;
+const GRANULARITY = 900; // 15 minutes
+const MAX_CANDLES = 70;
 
-const TIMEFRAME = 60; // 1 minute for fast testing
-const EMA_PERIOD = 5;  // Short EMA for frequent signals
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// ===== STORAGE =====
+const PAIRS = {
+    'cryBTCUSD': 'BTC/USD',
+    'frxEURUSD': 'EUR/USD',
+    'frxGBPUSD': 'GBP/USD',
+    'frxEURAUD': 'EUR/AUD',
+    'frxAUDCAD': 'AUD/CAD',
+    'frxUSDCAD': 'USD/CAD',
+    'frxAUDJPY': 'AUD/JPY'
+};
+
 let history = {};
 let lastAlertTime = {};
+Object.keys(PAIRS).forEach(sym => {
+    history[sym] = [];
+    lastAlertTime[sym] = 0;
+});
 
-// ===== EXPRESS SERVER =====
-const app = express();
-app.get('/ping', (req, res) => res.send("Bot Active"));
-app.listen(3000, () => console.log("🚀 Server started. Monitoring 7 pairs..."));
+let ws;
 
-// ===== TELEGRAM ALERT =====
-async function sendTelegramAlert(symbol, price, emaValue, type) {
+// --- 1. EXPRESS SERVER ---
+app.get('/ping', (req, res) => {
+    res.status(200).send("Bot is monitoring 15m Crossovers!");
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+// --- 2. TELEGRAM ALERT SYSTEM ---
+async function sendTelegramAlert(symbol, price, ema, type) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
+    const pairName = PAIRS[symbol];
     const emoji = type === "BUY" ? "🟢" : "🔴";
-    const message = `${emoji} ${symbol} ${type} SIGNAL\n\nPrice: ${price}\nEMA(${EMA_PERIOD}): ${emaValue.toFixed(5)}\nTime: ${new Date().toLocaleTimeString()}`;
+    const msg = `${emoji} *${pairName} ${type} SIGNAL*\n\nPrice has crossed the 21 EMA!\nPrice: ${price.toFixed(5)}\nEMA: ${ema.toFixed(5)}\nTimeframe: 15m`;
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELEGRAM_CHAT_ID}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`;
 
     try {
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: CHAT_ID, text: message })
-        });
-        console.log(`📡 Telegram Sent: ${symbol} ${type}`);
-    } catch (err) {
-        console.error("❌ Telegram Error:", err.message);
+        await fetch(url);
+        console.log(`[${new Date().toLocaleTimeString()}] ${type} Alert sent for ${pairName}`);
+    } catch (error) {
+        console.error(`Telegram Error:`, error);
     }
 }
 
-// ===== EMA CALCULATION =====
-function calculateEMA(closes) {
-    const k = 2 / (EMA_PERIOD + 1);
-    let emaArray = [closes[0]]; 
-    for (let i = 1; i < closes.length; i++) {
-        emaArray.push((closes[i] - emaArray[i - 1]) * k + emaArray[i - 1]);
+// --- 3. TELEGRAM STATUS COMMAND ---
+async function sendStatusMessage(targetChatId) {
+    let statusMsg = `📊 *Market Status (15m Crossover)*\n\n`;
+    let warmingUp = false;
+
+    for (const sym in PAIRS) {
+        if (history[sym].length < PERIOD) { warmingUp = true; break; }
+        const curr = history[sym][history[sym].length - 1];
+        const trend = curr.close >= curr.ema ? "🚀 Above EMA" : "📉 Below EMA";
+        statusMsg += `*${PAIRS[sym]}*: ${curr.close.toFixed(5)} - ${trend}\n`;
     }
-    return emaArray;
+
+    if (warmingUp) statusMsg = "⏳ *Warming up...* Gathering data.";
+    
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${targetChatId}&text=${encodeURIComponent(statusMsg)}&parse_mode=Markdown`);
 }
 
-// ===== MAIN CONNECTION =====
+// --- 4. TRADING LOGIC ---
+function calculateAllEMA(symbol) {
+    const symHistory = history[symbol];
+    const k = 2 / (PERIOD + 1);
+    for (let i = 0; i < symHistory.length; i++) {
+        if (i === 0) {
+            symHistory[i].ema = symHistory[i].close;
+        } else {
+            symHistory[i].ema = (symHistory[i].close - symHistory[i - 1].ema) * k + symHistory[i - 1].ema;
+        }
+    }
+}
+
 function connect() {
-    const ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
-    let pingInterval;
-
+    ws = new WebSocket(WS_URL);
+    
     ws.on('open', () => {
-        console.log("✅ Connected to Deriv API");
+        console.log("Connected to Deriv. Authenticating...");
         ws.send(JSON.stringify({ authorize: API_TOKEN }));
-        pingInterval = setInterval(() => ws.send(JSON.stringify({ ping: 1 })), 30000);
     });
 
-    ws.on('message', (msg) => {
-        const data = JSON.parse(msg);
+    ws.on('message', (data) => {
+        const response = JSON.parse(data);
 
-        if (data.msg_type === "authorize") {
-            SYMBOLS.forEach(symbol => {
-                ws.send(JSON.stringify({
-                    ticks_history: symbol,
-                    count: 50,
-                    end: "latest",
-                    granularity: TIMEFRAME,
-                    style: "candles",
-                    subscribe: 1
+        if (response.msg_type === 'authorize') {
+            Object.keys(PAIRS).forEach(sym => {
+                ws.send(JSON.stringify({ 
+                    ticks_history: sym, 
+                    count: MAX_CANDLES, 
+                    style: 'candles', 
+                    granularity: GRANULARITY, 
+                    subscribe: 1 
                 }));
             });
         }
 
-        if (data.msg_type === "ohlc") {
-            const symbol = data.echo_req.ticks_history;
-            const candle = data.ohlc;
+        if (response.msg_type === 'candles') {
+            const symbol = response.echo_req.ticks_history;
+            history[symbol] = response.candles.map(c => ({
+                time: c.epoch,
+                close: parseFloat(c.close)
+            }));
+            calculateAllEMA(symbol);
+            console.log(`History loaded for ${PAIRS[symbol]}`);
+        }
 
-            if (!history[symbol]) history[symbol] = [];
+        if (response.msg_type === 'ohlc') {
+            const symbol = response.ohlc.symbol;
+            const ohlc = response.ohlc;
+            const symHistory = history[symbol];
 
-            if (candle.is_closed) {
-                const currentPrice = parseFloat(candle.close);
-                history[symbol].push({ close: currentPrice });
-                if (history[symbol].length > 50) history[symbol].shift();
+            // Only process when a 15-minute candle officially closes
+            if (ohlc.is_closed) {
+                const newClose = parseFloat(ohlc.close);
+                
+                // Add closed candle to history
+                symHistory.push({ time: ohlc.open_time, close: newClose });
+                if (symHistory.length > MAX_CANDLES) symHistory.shift();
 
-                const closes = history[symbol].map(c => c.close);
-                if (closes.length < EMA_PERIOD + 2) return;
+                calculateAllEMA(symbol);
 
-                const emaValues = calculateEMA(closes);
-                const lastEMA = emaValues[emaValues.length - 1];
-                const prevEMA = emaValues[emaValues.length - 2];
-                const prevClose = closes[closes.length - 2];
+                if (symHistory.length < 2) return;
 
-                // --- TERMINAL LOGGING ---
-                console.log(`[${symbol}] Price: ${currentPrice} | EMA: ${lastEMA.toFixed(5)}`);
+                const current = symHistory[symHistory.length - 1];
+                const previous = symHistory[symHistory.length - 2];
 
-                // --- SIGNAL LOGIC ---
-                if (prevClose > prevEMA && currentPrice < lastEMA) {
-                    sendTelegramAlert(symbol, currentPrice, lastEMA, "SELL");
-                } else if (prevClose < prevEMA && currentPrice > lastEMA) {
-                    sendTelegramAlert(symbol, currentPrice, lastEMA, "BUY");
+                // CROSSOVER DETECTION
+                // BUY: Prev was below EMA, Current is above EMA
+                if (previous.close < previous.ema && current.close > current.ema) {
+                    sendTelegramAlert(symbol, current.close, current.ema, "BUY");
+                } 
+                // SELL: Prev was above EMA, Current is below EMA
+                else if (previous.close > previous.ema && current.close < current.ema) {
+                    sendTelegramAlert(symbol, current.close, current.ema, "SELL");
                 }
             }
         }
-
-        if (data.msg_type === "candles") {
-            const symbol = data.echo_req.ticks_history;
-            history[symbol] = data.candles.map(c => ({ close: parseFloat(c.close) }));
-            console.log(`📦 Loaded History: ${symbol}`);
-        }
     });
 
-    ws.on('close', () => {
-        console.log("⚠️ Disconnected. Reconnecting...");
-        clearInterval(pingInterval);
-        setTimeout(connect, 5000);
-    });
-
-    ws.on('error', () => ws.close());
+    ws.on('close', () => setTimeout(connect, 3000));
 }
 
 connect();

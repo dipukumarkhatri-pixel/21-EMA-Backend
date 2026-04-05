@@ -20,7 +20,7 @@ const PAIRS = {
 
 const PERIOD = 21;
 const MAX_CANDLES = 70;
-const TF = 900; // 15m
+const TF = 900;
 
 // ===== TELEGRAM =====
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -29,7 +29,7 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 let lastUpdateId = 0;
 let lastAlertTime = {};
 
-// ===== DATA STORE =====
+// ===== DATA =====
 let market = {};
 
 SYMBOLS.forEach(sym => {
@@ -45,19 +45,95 @@ SYMBOLS.forEach(sym => {
 function EMA(data) {
     let k = 2 / (PERIOD + 1);
     let ema = data[0];
-
     for (let i = 1; i < data.length; i++) {
         ema = (data[i] - ema) * k + ema;
     }
     return ema;
 }
 
-// ===== TICK → CANDLE =====
+// ===== BUILD CANDLES FROM TICKS =====
+function buildFromTicks(prices, times) {
+    let temp = {};
+
+    for (let i = 0; i < prices.length; i++) {
+        let price = prices[i];
+        let epoch = times[i];
+        let bucket = Math.floor(epoch / TF);
+
+        if (!temp[bucket]) {
+            temp[bucket] = {
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                bucket,
+                ema: null
+            };
+        } else {
+            temp[bucket].high = Math.max(temp[bucket].high, price);
+            temp[bucket].low = Math.min(temp[bucket].low, price);
+            temp[bucket].close = price;
+        }
+    }
+
+    return Object.values(temp).slice(-70);
+}
+
+// ===== LOAD HISTORY =====
+async function loadHistory(ws, symbol) {
+    return new Promise((resolve) => {
+
+        ws.send(JSON.stringify({
+            ticks_history: symbol,
+            adjust_start_time: 1,
+            count: 200,
+            end: "latest",
+            granularity: TF,
+            style: "candles"
+        }));
+
+        ws.once("message", (msg) => {
+            try {
+                const data = JSON.parse(msg);
+                const obj = market[symbol];
+
+                if (data.candles) {
+                    obj.candles = data.candles.map(c => ({
+                        open: c.open,
+                        high: c.high,
+                        low: c.low,
+                        close: c.close,
+                        bucket: Math.floor(c.epoch / TF),
+                        ema: null
+                    }));
+                    console.log("History loaded:", symbol);
+                }
+                else if (data.history) {
+                    obj.candles = buildFromTicks(data.history.prices, data.history.times);
+                    console.log("Built from ticks:", symbol);
+                }
+
+                // EMA
+                if (obj.candles.length > 0) {
+                    let closes = obj.candles.map(c => c.close);
+                    let ema = EMA(closes);
+                    obj.candles[obj.candles.length - 1].ema = ema;
+                }
+
+                resolve();
+            } catch {
+                resolve();
+            }
+        });
+
+    });
+}
+
+// ===== PROCESS TICK =====
 async function processTick(obj, price, epoch, symbol) {
 
-    const bucket = Math.floor(epoch / TF); // UTC
+    const bucket = Math.floor(epoch / TF);
 
-    // ===== NEW CANDLE =====
     if (!obj.current || obj.current.bucket !== bucket) {
 
         if (obj.current) {
@@ -66,12 +142,10 @@ async function processTick(obj, price, epoch, symbol) {
             if (obj.candles.length > MAX_CANDLES)
                 obj.candles.shift();
 
-            // ===== EMA =====
             let closes = obj.candles.map(c => c.close);
             let ema = EMA(closes);
             obj.current.ema = ema;
 
-            // ===== SIGNAL =====
             if (obj.candles.length > 1) {
                 let prev = obj.candles[obj.candles.length - 2];
                 let curr = obj.candles[obj.candles.length - 1];
@@ -89,7 +163,6 @@ async function processTick(obj, price, epoch, symbol) {
             }
         }
 
-        // ===== CREATE NEW =====
         obj.current = {
             bucket,
             open: price,
@@ -100,88 +173,28 @@ async function processTick(obj, price, epoch, symbol) {
         };
 
     } else {
-        // ===== UPDATE =====
         obj.current.high = Math.max(obj.current.high, price);
         obj.current.low = Math.min(obj.current.low, price);
         obj.current.close = price;
     }
 }
 
-// ===== TELEGRAM SEND =====
+// ===== TELEGRAM =====
 async function sendTelegram(symbol, type, price, ema) {
     if (!BOT_TOKEN || !CHAT_ID) return;
 
     const now = Date.now();
     if (now - lastAlertTime[symbol] < 60000) return;
 
-    const msg = `🚨 ${PAIRS[symbol]} ${type}\n
-Price: ${price.toFixed(5)}
-EMA: ${ema.toFixed(5)}\n
-TF: 15m`;
+    const msg = `🚨 ${PAIRS[symbol]} ${type}\nPrice: ${price.toFixed(5)}\nEMA: ${ema.toFixed(5)}\nTF: 15m`;
 
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}`;
 
     try {
         await fetch(url);
-        console.log("📩 Sent:", symbol, type);
         lastAlertTime[symbol] = now;
-    } catch (e) {
-        console.log("Telegram error");
-    }
+    } catch {}
 }
-
-// ===== TELEGRAM STATUS =====
-async function sendStatus(chatId) {
-    let text = "📊 LIVE STATUS (15m)\n\n";
-
-    for (let sym of SYMBOLS) {
-        let data = market[sym];
-
-        let last = data.candles[data.candles.length - 1] || data.current;
-
-        if (!last) {
-            text += `${PAIRS[sym]}: no data\n`;
-            continue;
-        }
-
-        let ema = last.ema || 0;
-        let trend = ema && last.close > ema ? "Bullish 📈" : "Bearish 📉";
-
-        text += `${PAIRS[sym]}
-Price: ${last.close.toFixed(5)}
-EMA: ${ema ? ema.toFixed(5) : "loading"}
-Signal: ${data.signal}
-Trend: ${trend}
-
-`;
-    }
-
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}`);
-}
-
-// ===== TELEGRAM LISTENER =====
-async function pollTelegram() {
-    if (!BOT_TOKEN) return;
-
-    try {
-        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`);
-        const data = await res.json();
-
-        if (data.result.length > 0) {
-            for (let u of data.result) {
-                lastUpdateId = u.update_id;
-
-                if (u.message && u.message.text === "/status") {
-                    sendStatus(u.message.chat.id);
-                }
-            }
-        }
-    } catch (e) {}
-
-    setTimeout(pollTelegram, 2000);
-}
-
-pollTelegram();
 
 // ===== WS =====
 let ws;
@@ -189,67 +202,61 @@ let ws;
 function connect() {
     ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
-    ws.on("open", () => {
+    ws.on("open", async () => {
         console.log("Connected");
 
-        SYMBOLS.forEach(sym => {
+        for (let sym of SYMBOLS) {
+            await loadHistory(ws, sym);
+
             ws.send(JSON.stringify({
                 ticks: sym,
                 subscribe: 1
             }));
-        });
+        }
     });
 
     ws.on("message", async (msg) => {
         try {
             const data = JSON.parse(msg);
 
-            if (data.msg_type !== "tick" || !data.tick || !data.tick.quote) return;
+            if (data.msg_type !== "tick" || !data.tick) return;
 
             const sym = data.echo_req?.ticks;
-            if (!sym || !market[sym]) return;
+            if (!market[sym]) return;
 
-            const price = data.tick.quote;
-            const epoch = data.tick.epoch;
+            await processTick(
+                market[sym],
+                data.tick.quote,
+                data.tick.epoch,
+                sym
+            );
 
-            const obj = market[sym];
-
-            // ✅ TICK → CANDLE
-            await processTick(obj, price, epoch, sym);
-
-        } catch (err) {
-            console.error("WS Error:", err);
-        }
+        } catch (e) {}
     });
 
     ws.on("close", () => {
-        console.log("Reconnecting...");
         setTimeout(connect, 3000);
     });
-
-    ws.on("error", () => {});
 }
 
 connect();
 
 // ===== API =====
-app.get("/data", (req, res) => {
-    res.json(market);
+app.get("/ping", (req, res) => res.send("Bot running 🚀"));
+
+app.listen(PORT, () => {
+    console.log("Server running on", PORT);
 });
 
 app.get("/ping", (req, res) => {
     res.send("Bot running 🚀");
 });
 
-app.listen(PORT, () => {
-    console.log("Server running on", PORT);
-});
-
 // ===== CRASH PROTECTION =====
 process.on("uncaughtException", (err) => {
-    console.error("Uncaught Exception:", err);
+    console.error("🔥 Uncaught Exception:", err);
 });
 
 process.on("unhandledRejection", (err) => {
-    console.error("Unhandled Rejection:", err);
+    console.error("⚠️ Unhandled Rejection:", err);
 });

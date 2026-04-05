@@ -1,6 +1,9 @@
 const WebSocket = require("ws");
 const express = require("express");
 
+// ✅ safer fetch (important for Render)
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -8,13 +11,11 @@ const PORT = process.env.PORT || 3000;
 const SYMBOLS = [
     "frxEURUSD",
     "frxAUDCAD",
-  
 ];
 
 const PAIRS = {
     "frxEURUSD": "EUR/USD",
     "frxAUDCAD": "AUD/CAD",
-
 };
 
 const PERIOD = 21;
@@ -59,7 +60,6 @@ async function sendTelegram(symbol, type, price, ema) {
     if (now - lastAlertTime[symbol] < 60000) return;
 
     const msg = `🚨 ${PAIRS[symbol]} ${type}\n
-
 Price: ${price.toFixed(5)}
 EMA: ${ema.toFixed(5)}\n
 TF: 15m`;
@@ -144,62 +144,69 @@ function connect() {
     });
 
     ws.on("message", async (msg) => {
-        const data = JSON.parse(msg);
+        try {
+            const data = JSON.parse(msg);
 
-        if (data.msg_type !== "tick") return;
+            // ✅ FIX: prevent crash
+            if (data.msg_type !== "tick" || !data.tick || !data.tick.quote) return;
 
-        const sym = data.echo_req.ticks;
-        const price = data.tick.quote;
-        const epoch = data.tick.epoch;
+            const sym = data.echo_req?.ticks;
+            if (!sym || !market[sym]) return;
 
-        const obj = market[sym];
-        const bucket = Math.floor(epoch / TF);
+            const price = data.tick.quote;
+            const epoch = data.tick.epoch;
 
-        if (!obj.current || obj.current.bucket !== bucket) {
+            const obj = market[sym];
+            const bucket = Math.floor(epoch / TF);
 
-            // ===== CLOSE CANDLE =====
-            if (obj.current) {
-                obj.candles.push(obj.current);
+            if (!obj.current || obj.current.bucket !== bucket) {
 
-                if (obj.candles.length > MAX_CANDLES)
-                    obj.candles.shift();
+                // ===== CLOSE CANDLE =====
+                if (obj.current) {
+                    obj.candles.push(obj.current);
 
-                let closes = obj.candles.map(c => c.close);
-                let ema = EMA(closes);
+                    if (obj.candles.length > MAX_CANDLES)
+                        obj.candles.shift();
 
-                obj.current.ema = ema;
+                    let closes = obj.candles.map(c => c.close);
+                    let ema = EMA(closes);
 
-                if (obj.candles.length > 1) {
-                    let prev = obj.candles[obj.candles.length - 2];
-                    let curr = obj.candles[obj.candles.length - 1];
+                    obj.current.ema = ema;
 
-                    // ===== CROSS =====
-                    if (prev.close < prev.ema && curr.close > curr.ema) {
-                        obj.signal = "BUY 🚀";
-                        await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
-                    }
-                    else if (prev.close > prev.ema && curr.close < curr.ema) {
-                        obj.signal = "SELL 🔻";
-                        await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
-                    } else {
-                        obj.signal = "WAIT";
+                    if (obj.candles.length > 1) {
+                        let prev = obj.candles[obj.candles.length - 2];
+                        let curr = obj.candles[obj.candles.length - 1];
+
+                        if (prev.close < prev.ema && curr.close > curr.ema) {
+                            obj.signal = "BUY 🚀";
+                            await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
+                        }
+                        else if (prev.close > prev.ema && curr.close < curr.ema) {
+                            obj.signal = "SELL 🔻";
+                            await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
+                        } else {
+                            obj.signal = "WAIT";
+                        }
                     }
                 }
+
+                obj.current = {
+                    bucket,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    ema: null
+                };
+
+            } else {
+                obj.current.high = Math.max(obj.current.high, price);
+                obj.current.low = Math.min(obj.current.low, price);
+                obj.current.close = price;
             }
 
-            obj.current = {
-                bucket,
-                open: price,
-                high: price,
-                low: price,
-                close: price,
-                ema: null
-            };
-
-        } else {
-            obj.current.high = Math.max(obj.current.high, price);
-            obj.current.low = Math.min(obj.current.low, price);
-            obj.current.close = price;
+        } catch (err) {
+            console.error("WS Error:", err);
         }
     });
 
@@ -224,4 +231,13 @@ app.get("/ping", (req, res) => {
 
 app.listen(PORT, () => {
     console.log("Server running on", PORT);
+});
+
+// ===== GLOBAL CRASH PROTECTION =====
+process.on("uncaughtException", (err) => {
+    console.error("Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+    console.error("Unhandled Rejection:", err);
 });

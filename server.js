@@ -7,20 +7,14 @@ const PORT = process.env.PORT || 3000;
 // ===== CONFIG =====
 const SYMBOLS = [
     "frxEURUSD",
-    "frxGBPUSD",
     "frxAUDCAD",
-    "frxEURCAD",
-    "frxAUDJPY",
-    "frxUSDCAD"
+  
 ];
 
 const PAIRS = {
     "frxEURUSD": "EUR/USD",
-    "frxGBPUSD": "GBP/USD",
     "frxAUDCAD": "AUD/CAD",
-    "frxEURCAD": "EUR/CAD",
-    "frxAUDJPY": "AUD/JPY",
-    "frxUSDCAD": "USD/CAD"
+
 };
 
 const PERIOD = 21;

@@ -1,7 +1,7 @@
 const WebSocket = require("ws");
 const express = require("express");
 
-// ✅ safer fetch (important for Render)
+// safer fetch
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 const app = express();
@@ -10,12 +10,12 @@ const PORT = process.env.PORT || 3000;
 // ===== CONFIG =====
 const SYMBOLS = [
     "frxEURUSD",
-    "frxAUDCAD",
+    "frxAUDCAD"
 ];
 
 const PAIRS = {
     "frxEURUSD": "EUR/USD",
-    "frxAUDCAD": "AUD/CAD",
+    "frxAUDCAD": "AUD/CAD"
 };
 
 const PERIOD = 21;
@@ -52,6 +52,58 @@ function EMA(data) {
     return ema;
 }
 
+// ===== LOAD HISTORY =====
+async function loadHistory(ws, symbol) {
+    return new Promise((resolve) => {
+
+        ws.send(JSON.stringify({
+            ticks_history: symbol,
+            adjust_start_time: 1,
+            count: 70,
+            end: "latest",
+            granularity: TF,
+            style: "candles"
+        }));
+
+        ws.once("message", (msg) => {
+            try {
+                const data = JSON.parse(msg);
+
+                if (!data.candles) {
+                    console.log("No history:", symbol);
+                    return resolve();
+                }
+
+                const obj = market[symbol];
+                obj.candles = [];
+
+                data.candles.forEach(c => {
+                    obj.candles.push({
+                        open: c.open,
+                        high: c.high,
+                        low: c.low,
+                        close: c.close,
+                        bucket: Math.floor(c.epoch / TF), // UTC
+                        ema: null
+                    });
+                });
+
+                let closes = obj.candles.map(c => c.close);
+                let ema = EMA(closes);
+                obj.candles[obj.candles.length - 1].ema = ema;
+
+                console.log("History loaded:", symbol);
+                resolve();
+
+            } catch (e) {
+                console.log("History error");
+                resolve();
+            }
+        });
+
+    });
+}
+
 // ===== TELEGRAM SEND =====
 async function sendTelegram(symbol, type, price, ema) {
     if (!BOT_TOKEN || !CHAT_ID) return;
@@ -81,18 +133,20 @@ async function sendStatus(chatId) {
 
     for (let sym of SYMBOLS) {
         let data = market[sym];
-        let last = data.candles[data.candles.length - 1];
+
+        let last = data.candles[data.candles.length - 1] || data.current;
 
         if (!last) {
-            text += `${PAIRS[sym]}: warming...\n`;
+            text += `${PAIRS[sym]}: no data\n`;
             continue;
         }
 
-        let trend = last.close > last.ema ? "Bullish 📈" : "Bearish 📉";
+        let ema = last.ema || 0;
+        let trend = ema && last.close > ema ? "Bullish 📈" : "Bearish 📉";
 
         text += `${PAIRS[sym]}
 Price: ${last.close.toFixed(5)}
-EMA: ${last.ema.toFixed(5)}
+EMA: ${ema ? ema.toFixed(5) : "loading"}
 Signal: ${data.signal}
 Trend: ${trend}
 
@@ -132,22 +186,23 @@ let ws;
 function connect() {
     ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
-    ws.on("open", () => {
+    ws.on("open", async () => {
         console.log("Connected");
 
-        SYMBOLS.forEach(sym => {
+        for (let sym of SYMBOLS) {
+            await loadHistory(ws, sym);
+
             ws.send(JSON.stringify({
                 ticks: sym,
                 subscribe: 1
             }));
-        });
+        }
     });
 
     ws.on("message", async (msg) => {
         try {
             const data = JSON.parse(msg);
 
-            // ✅ FIX: prevent crash
             if (data.msg_type !== "tick" || !data.tick || !data.tick.quote) return;
 
             const sym = data.echo_req?.ticks;
@@ -157,11 +212,10 @@ function connect() {
             const epoch = data.tick.epoch;
 
             const obj = market[sym];
-            const bucket = Math.floor(epoch / TF);
+            const bucket = Math.floor(epoch / TF); // UTC
 
             if (!obj.current || obj.current.bucket !== bucket) {
 
-                // ===== CLOSE CANDLE =====
                 if (obj.current) {
                     obj.candles.push(obj.current);
 
@@ -233,7 +287,7 @@ app.listen(PORT, () => {
     console.log("Server running on", PORT);
 });
 
-// ===== GLOBAL CRASH PROTECTION =====
+// ===== CRASH PROTECTION =====
 process.on("uncaughtException", (err) => {
     console.error("Uncaught Exception:", err);
 });

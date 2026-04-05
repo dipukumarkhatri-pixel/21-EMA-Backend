@@ -7,20 +7,12 @@ const PORT = process.env.PORT || 3000;
 // ===== CONFIG =====
 const SYMBOLS = [
     "frxEURUSD",
-    "frxGBPUSD",
     "frxAUDCAD",
-    "frxEURCAD",
-    "frxAUDJPY",
-    "frxUSDCAD"
 ];
 
 const PAIRS = {
     "frxEURUSD": "EUR/USD",
-    "frxGBPUSD": "GBP/USD",
     "frxAUDCAD": "AUD/CAD",
-    "frxEURCAD": "EUR/CAD",
-    "frxAUDJPY": "AUD/JPY",
-    "frxUSDCAD": "USD/CAD"
 };
 
 const PERIOD = 21;
@@ -150,62 +142,70 @@ function connect() {
     });
 
     ws.on("message", async (msg) => {
-        const data = JSON.parse(msg);
+        try {
+            const data = JSON.parse(msg);
 
-        if (data.msg_type !== "tick") return;
+            if (data.msg_type !== "tick") return;
 
-        const sym = data.echo_req.ticks;
-        const price = data.tick.quote;
-        const epoch = data.tick.epoch;
+            // ===== SAFEGUARD =====
+            // Ensure data.tick and data.tick.quote exist before reading them
+            if (!data.tick || !data.tick.quote) return;
 
-        const obj = market[sym];
-        const bucket = Math.floor(epoch / TF);
+            const sym = data.echo_req.ticks;
+            const price = data.tick.quote;
+            const epoch = data.tick.epoch;
 
-        if (!obj.current || obj.current.bucket !== bucket) {
+            const obj = market[sym];
+            const bucket = Math.floor(epoch / TF);
 
-            // ===== CLOSE CANDLE =====
-            if (obj.current) {
-                obj.candles.push(obj.current);
+            if (!obj.current || obj.current.bucket !== bucket) {
 
-                if (obj.candles.length > MAX_CANDLES)
-                    obj.candles.shift();
+                // ===== CLOSE CANDLE =====
+                if (obj.current) {
+                    obj.candles.push(obj.current);
 
-                let closes = obj.candles.map(c => c.close);
-                let ema = EMA(closes);
+                    if (obj.candles.length > MAX_CANDLES)
+                        obj.candles.shift();
 
-                obj.current.ema = ema;
+                    let closes = obj.candles.map(c => c.close);
+                    let ema = EMA(closes);
 
-                if (obj.candles.length > 1) {
-                    let prev = obj.candles[obj.candles.length - 2];
-                    let curr = obj.candles[obj.candles.length - 1];
+                    obj.current.ema = ema;
 
-                    // ===== CROSS =====
-                    if (prev.close < prev.ema && curr.close > curr.ema) {
-                        obj.signal = "BUY 🚀";
-                        await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
-                    }
-                    else if (prev.close > prev.ema && curr.close < curr.ema) {
-                        obj.signal = "SELL 🔻";
-                        await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
-                    } else {
-                        obj.signal = "WAIT";
+                    if (obj.candles.length > 1) {
+                        let prev = obj.candles[obj.candles.length - 2];
+                        let curr = obj.candles[obj.candles.length - 1];
+
+                        // ===== CROSS =====
+                        if (prev.close < prev.ema && curr.close > curr.ema) {
+                            obj.signal = "BUY 🚀";
+                            await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
+                        }
+                        else if (prev.close > prev.ema && curr.close < curr.ema) {
+                            obj.signal = "SELL 🔻";
+                            await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
+                        } else {
+                            obj.signal = "WAIT";
+                        }
                     }
                 }
+
+                obj.current = {
+                    bucket,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    ema: null
+                };
+
+            } else {
+                obj.current.high = Math.max(obj.current.high, price);
+                obj.current.low = Math.min(obj.current.low, price);
+                obj.current.close = price;
             }
-
-            obj.current = {
-                bucket,
-                open: price,
-                high: price,
-                low: price,
-                close: price,
-                ema: null
-            };
-
-        } else {
-            obj.current.high = Math.max(obj.current.high, price);
-            obj.current.low = Math.min(obj.current.low, price);
-            obj.current.close = price;
+        } catch (error) {
+            // Silently catch JSON parsing errors to prevent crashes
         }
     });
 

@@ -20,7 +20,7 @@ const PAIRS = {
 
 const PERIOD = 21;
 const MAX_CANDLES = 70;
-const TF = 900;
+const TF = 900; // 15m
 
 // ===== TELEGRAM =====
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -52,56 +52,59 @@ function EMA(data) {
     return ema;
 }
 
-// ===== LOAD HISTORY =====
-async function loadHistory(ws, symbol) {
-    return new Promise((resolve) => {
+// ===== TICK → CANDLE =====
+async function processTick(obj, price, epoch, symbol) {
 
-        ws.send(JSON.stringify({
-            ticks_history: symbol,
-            adjust_start_time: 1,
-            count: 70,
-            end: "latest",
-            granularity: TF,
-            style: "candles"
-        }));
+    const bucket = Math.floor(epoch / TF); // UTC
 
-        ws.once("message", (msg) => {
-            try {
-                const data = JSON.parse(msg);
+    // ===== NEW CANDLE =====
+    if (!obj.current || obj.current.bucket !== bucket) {
 
-                if (!data.candles) {
-                    console.log("No history:", symbol);
-                    return resolve();
+        if (obj.current) {
+            obj.candles.push(obj.current);
+
+            if (obj.candles.length > MAX_CANDLES)
+                obj.candles.shift();
+
+            // ===== EMA =====
+            let closes = obj.candles.map(c => c.close);
+            let ema = EMA(closes);
+            obj.current.ema = ema;
+
+            // ===== SIGNAL =====
+            if (obj.candles.length > 1) {
+                let prev = obj.candles[obj.candles.length - 2];
+                let curr = obj.candles[obj.candles.length - 1];
+
+                if (prev.close < prev.ema && curr.close > curr.ema) {
+                    obj.signal = "BUY 🚀";
+                    await sendTelegram(symbol, "BUY 🚀", curr.close, curr.ema);
                 }
-
-                const obj = market[symbol];
-                obj.candles = [];
-
-                data.candles.forEach(c => {
-                    obj.candles.push({
-                        open: c.open,
-                        high: c.high,
-                        low: c.low,
-                        close: c.close,
-                        bucket: Math.floor(c.epoch / TF), // UTC
-                        ema: null
-                    });
-                });
-
-                let closes = obj.candles.map(c => c.close);
-                let ema = EMA(closes);
-                obj.candles[obj.candles.length - 1].ema = ema;
-
-                console.log("History loaded:", symbol);
-                resolve();
-
-            } catch (e) {
-                console.log("History error");
-                resolve();
+                else if (prev.close > prev.ema && curr.close < curr.ema) {
+                    obj.signal = "SELL 🔻";
+                    await sendTelegram(symbol, "SELL 🔻", curr.close, curr.ema);
+                } else {
+                    obj.signal = "WAIT";
+                }
             }
-        });
+        }
 
-    });
+        // ===== CREATE NEW =====
+        obj.current = {
+            bucket,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            ema: null
+        };
+
+    } else {
+        // ===== UPDATE =====
+        obj.current.high = Math.max(obj.current.high, price);
+        obj.current.low = Math.min(obj.current.low, price);
+        obj.current.close = price;
+    }
 }
 
 // ===== TELEGRAM SEND =====
@@ -186,17 +189,15 @@ let ws;
 function connect() {
     ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
 
-    ws.on("open", async () => {
+    ws.on("open", () => {
         console.log("Connected");
 
-        for (let sym of SYMBOLS) {
-            await loadHistory(ws, sym);
-
+        SYMBOLS.forEach(sym => {
             ws.send(JSON.stringify({
                 ticks: sym,
                 subscribe: 1
             }));
-        }
+        });
     });
 
     ws.on("message", async (msg) => {
@@ -212,52 +213,9 @@ function connect() {
             const epoch = data.tick.epoch;
 
             const obj = market[sym];
-            const bucket = Math.floor(epoch / TF); // UTC
 
-            if (!obj.current || obj.current.bucket !== bucket) {
-
-                if (obj.current) {
-                    obj.candles.push(obj.current);
-
-                    if (obj.candles.length > MAX_CANDLES)
-                        obj.candles.shift();
-
-                    let closes = obj.candles.map(c => c.close);
-                    let ema = EMA(closes);
-
-                    obj.current.ema = ema;
-
-                    if (obj.candles.length > 1) {
-                        let prev = obj.candles[obj.candles.length - 2];
-                        let curr = obj.candles[obj.candles.length - 1];
-
-                        if (prev.close < prev.ema && curr.close > curr.ema) {
-                            obj.signal = "BUY 🚀";
-                            await sendTelegram(sym, "BUY 🚀", curr.close, curr.ema);
-                        }
-                        else if (prev.close > prev.ema && curr.close < curr.ema) {
-                            obj.signal = "SELL 🔻";
-                            await sendTelegram(sym, "SELL 🔻", curr.close, curr.ema);
-                        } else {
-                            obj.signal = "WAIT";
-                        }
-                    }
-                }
-
-                obj.current = {
-                    bucket,
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    ema: null
-                };
-
-            } else {
-                obj.current.high = Math.max(obj.current.high, price);
-                obj.current.low = Math.min(obj.current.low, price);
-                obj.current.close = price;
-            }
+            // ✅ TICK → CANDLE
+            await processTick(obj, price, epoch, sym);
 
         } catch (err) {
             console.error("WS Error:", err);
